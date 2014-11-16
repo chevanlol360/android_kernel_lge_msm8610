@@ -985,8 +985,13 @@ static void safety_reset(struct lge_touch_data *ts)
 	}
 	release_all_ts_event(ts);
 
-	touch_power_cntl(ts, POWER_OFF);
-	touch_power_cntl(ts, POWER_ON);
+	if (ts->pdata->role->suspend_pwr == POWER_OFF) {
+		touch_power_cntl(ts, POWER_OFF);
+		touch_power_cntl(ts, POWER_ON);
+	} else if (ts->pdata->role->suspend_pwr == POWER_SLEEP) {
+		TOUCH_INFO_MSG("SOFT RESET in safety_reset func");
+		touch_device_func->ic_ctrl(ts->client, IC_CTRL_RESET_CMD, 0);
+	} else {}
 	msleep(ts->pdata->role->booting_delay);
 
 	if (ts->pdata->role->operation_mode)
@@ -1773,6 +1778,8 @@ static void touch_work_func_a(struct work_struct *work)
 	u8 report_enable = 0;
 	int ret = 0;
 
+	mutex_lock(&ts->irq_work_mutex);
+
 	if (ts->pdata->role->ghost_detection_enable) {
 		if(trigger_baseline == 2){
 			ret = ghost_detect_solution(ts);
@@ -1787,8 +1794,10 @@ static void touch_work_func_a(struct work_struct *work)
 		goto err_out_critical;
 	else if (ret == -EAGAIN)
 		goto out;
-	else if (ret == -IGNORE_INTERRUPT)
+	else if (ret == -IGNORE_INTERRUPT) {
+		mutex_unlock(&ts->irq_work_mutex);
 		return;
+	}
 
 	/* Ghost detection solution */
 	if (ts->pdata->role->ghost_detection_enable) {
@@ -3215,7 +3224,6 @@ static int touch_fb_resume(struct device *device);
 #endif
 static ssize_t store_lpwg_notify(struct lge_touch_data *ts, const char *buf, size_t count)
 {
-    static int suspend = 0;
     int type = 0;
     int value[4] = {0};
 
@@ -3229,9 +3237,8 @@ static ssize_t store_lpwg_notify(struct lge_touch_data *ts, const char *buf, siz
 			mutex_lock(&ts->irq_work_mutex);
 			if(value[0]) touch_gesture_enable = 1;
 			else touch_gesture_enable = 0;
+			atomic_set(&ts->device_init, 1);
 			mutex_unlock(&ts->irq_work_mutex);
-			if (suspend)
-				touch_fb_suspend(&ts->client->dev);
             break;
         case 2 :
 			touch_device_func->lpwg(ts->client, LPWG_LCD_X, value[0], NULL);
@@ -3249,14 +3256,23 @@ static ssize_t store_lpwg_notify(struct lge_touch_data *ts, const char *buf, siz
         case 6 :
 #if defined(CONFIG_FB)
 			if(value[0] == 0) {
-				suspend = 1;
 				if (touch_gesture_enable)
 					touch_fb_suspend(&ts->client->dev);
-			} else if(value[0] == 1) {
- 				suspend = 0;
+				else if(!touch_gesture_enable)
+					touch_device_func->suspend(ts->client);
+			}
+			else if(value[0] == 1){
+				touch_device_func->lpwg(ts->client, LPWG_MODE_CHANGE, value[0], NULL);
 				touch_fb_resume(&ts->client->dev);
 			}
 #endif
+            break;
+        case 7 :
+			touch_device_func->lpwg(ts->client, LPWG_STATUS_BY_PROXI, value[0], NULL);
+			mutex_lock(&ts->irq_work_mutex);
+			touch_gesture_enable = 1;
+			atomic_set(&ts->device_init, 1);
+			mutex_unlock(&ts->irq_work_mutex);
             break;
         default:
             break;
@@ -3290,6 +3306,27 @@ static ssize_t show_global_access_pixel(struct lge_touch_data *ts, char *buf)
 	return ret;
 }
 
+static ssize_t mfts_enable_show(struct lge_touch_data *data, char *buf)
+{
+	int len = 0;
+
+	len += snprintf(buf + len, PAGE_SIZE - len, "%d\n", data->mfts_enable);
+
+	return len;
+}
+
+static ssize_t mfts_enable_store(struct lge_touch_data *data, const char *buf, size_t count)
+{
+	int value = 0;
+
+	sscanf(buf, "%d", &value);
+
+	TOUCH_INFO_MSG("%s = %d \n", __func__, value);
+
+	data->mfts_enable = value;
+
+	return count;
+}
 
 
 static LGE_TOUCH_ATTR(platform_data, S_IRUGO | S_IWUSR, show_platform_data, NULL);
@@ -3318,6 +3355,7 @@ static LGE_TOUCH_ATTR(power_control, S_IRUGO | S_IWUSR, NULL, power_control_stor
 static LGE_TOUCH_ATTR(global_access_pixel, S_IRUGO | S_IWUSR, show_global_access_pixel, store_global_access_pixel);
 static LGE_TOUCH_ATTR(lpwg_data, S_IRUGO | S_IWUSR, show_lpwg_data, store_lpwg_data);
 static LGE_TOUCH_ATTR(lpwg_notify, S_IRUGO | S_IWUSR, NULL, store_lpwg_notify);
+static LGE_TOUCH_ATTR(mfts, S_IWUSR | S_IRUSR, mfts_enable_show, mfts_enable_store);
 
 static struct attribute *lge_touch_attribute_list[] = {
 	&lge_touch_attr_platform_data.attr,
@@ -3346,6 +3384,7 @@ static struct attribute *lge_touch_attribute_list[] = {
 	&lge_touch_attr_global_access_pixel.attr,
 	&lge_touch_attr_lpwg_data.attr,
 	&lge_touch_attr_lpwg_notify.attr,
+	&lge_touch_attr_mfts.attr,
 	NULL,
 };
 
@@ -3472,7 +3511,7 @@ static int synaptics_parse_dt(struct device *dev, struct touch_platform_data *pd
 	const char *temp_string = node->name;
 	const char *reg_string = node->name;
 	u32 temp_val;
-	u32 temp_array[10];
+	u32 temp_array[16];
 
 	/* reset, irq gpio info */
 	if (node == NULL)
@@ -3490,25 +3529,39 @@ static int synaptics_parse_dt(struct device *dev, struct touch_platform_data *pd
 	}
 	len = strlen(temp_string);
 	memcpy(pdata->maker, temp_string, len);
-	rc = of_property_read_u32_array(node, "synaptics,fw_version_info", pdata->fw_version, FW_VER_INFO_NUM-1);
-	if(rc){
+	rc = of_property_read_u32_array(node, "synaptics,fw_version_info", temp_array, FW_VER_INFO_NUM-1);
+	if (rc) {
 		TOUCH_DEBUG_MSG( "Looking up %s property in node %02X %02X %02X failed",
 			"synaptics,fw_version",
-			pdata->fw_version[0], pdata->fw_version[1], pdata->fw_version[2]);
+			temp_array[0], temp_array[1], temp_array[2]);
 		return -ENODEV;
-	}
-	else
-		TOUCH_INFO_MSG("fw_ver_info : 0x%02X 0x%02X 0x%02X \n",
+	} else {
+		for(i = 0; i < FW_VER_INFO_NUM-1; i++){
+			pdata->fw_version[i] = temp_array[i];
+		}
+		TOUCH_DEBUG_MSG("fw_ver_info : 0x%02X 0x%02X 0x%02X \n",
 			pdata->fw_version[0], pdata->fw_version[1], pdata->fw_version[2]);
+	}
 
-	rc = of_property_read_string(node, "synaptics,fw_image",  &pdata->inbuilt_fw_name);
-	if (rc) {
-		TOUCH_DEBUG_MSG( "Looking up %s property in node %s failed",
-			"synaptics,fw_image", pdata->inbuilt_fw_name);
-		return -ENODEV;
+	rc = of_property_count_strings(node, "synaptics,fw_image");
+	TOUCH_INFO_MSG("firmware path, rc = %d ", rc);
+	if (rc > 1) {
+		TOUCH_DEBUG_MSG("Get latter inbuilt firmware path ..., due to different type of panel");
+		for (i = 0; i < rc; i++) {
+			of_property_read_string_index(node, "synaptics,fw_image", i, &pdata->inbuilt_fw_name_id[i]);
+			TOUCH_INFO_MSG("fw_image [%d]: %s", i, pdata->inbuilt_fw_name_id[i]);
+		}
+	} else {
+		rc = of_property_read_string_index(node, "synaptics,fw_image", 0, &pdata->inbuilt_fw_name_id[0]);
+		if (rc) {
+			TOUCH_DEBUG_MSG( "Looking up %s property in node %s failed",
+				"synaptics,fw_image", pdata->inbuilt_fw_name);
+			return -ENODEV;
+		} else {
+			pdata->inbuilt_fw_name = pdata->inbuilt_fw_name_id[0];
+			TOUCH_DEBUG_MSG("fw_image: %s", pdata->inbuilt_fw_name);
+		}
 	}
-	else
-		TOUCH_DEBUG_MSG("fw_image: %s",pdata->inbuilt_fw_name);
 
 	rc = of_property_read_u32(node, "lge,knock_on_type",  &temp_val);
 	if (rc) {
@@ -3532,14 +3585,24 @@ static int synaptics_parse_dt(struct device *dev, struct touch_platform_data *pd
 	if (!caps_info)
 		return -ENOMEM;
 
-	rc = of_property_read_string(node, "synaptics,panel_spec",  &pdata->panel_spec);
+	rc = of_property_count_strings(node, "synaptics,panel_spec");
+	TOUCH_INFO_MSG("panel_spec, rc = %d ", rc);
+	if (rc > 1) {
+		TOUCH_DEBUG_MSG("Get latter panel spec ..., due to different type of panel");
+		for (i = 0; i < rc; i++) {
+			of_property_read_string_index(node, "synaptics,panel_spec", i, &pdata->panel_spec_id[i]);
+			TOUCH_INFO_MSG("panel_spec [%d]: %s", i, pdata->panel_spec_id[i]);
+		}
+	} else {
+		rc = of_property_read_string_index(node, "synaptics,panel_spec", 0, &pdata->panel_spec_id[0]);
 		if (rc) {
 			TOUCH_DEBUG_MSG( "Looking up %s property in node %s failed",
 				"synaptics,panel_spec", pdata->panel_spec);
-		}
-		else {
+		} else {
+			pdata->panel_spec = pdata->panel_spec_id[0];
 			TOUCH_DEBUG_MSG("panel_spec: %s",pdata->panel_spec);
 		}
+	}
 
 	/*global_access_pixel parsing*/
 	rc = of_property_read_u32(node, "synaptics,global_access_pixel", &pdata->global_access_pixel);
@@ -3688,6 +3751,14 @@ static int synaptics_parse_dt(struct device *dev, struct touch_platform_data *pd
 			caps_info->maker_id_gpio =  0;
 		} else
 			caps_info->maker_id_gpio =  temp_val;
+
+		rc = of_property_read_u32(pp, "maker_id2_gpio", &temp_val);
+		if (rc && (rc != -EINVAL)) {
+			TOUCH_DEBUG_MSG( "Unable to read maker_id2_gpio\n");
+			caps_info->maker_id2_gpio =  0;
+		} else{
+			caps_info->maker_id2_gpio =  temp_val;
+		}
 
 		prop = of_find_property(pp, "ghost_detection_value", NULL);
 		if (prop) {
